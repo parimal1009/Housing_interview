@@ -1,0 +1,67 @@
+# Core FastAPI and ASGI server
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+python-dotenv
+
+# AI/ML Libraries
+torch
+torchaudio
+transformers
+accelerate
+datasets
+librosa
+soundfile
+numpy
+scipy
+
+# Groq API client
+groq
+
+# LangChain and LangSmith
+langchain
+langchain-groq
+langchain-community
+langsmith
+
+# Additional utilities
+requests
+aiofiles
+python-jose[cryptography]
+passlib[bcrypt]
+httpx
+
+# Audio processing dependencies
+ffmpeg-python
+pydub
+
+# Data handling
+pandas
+jsonschema
+
+# Development and testing (optional)
+pytest
+pytest-asyncio
+black
+flake8
+mypy
+
+# Security
+cryptography
+bcrypt
+
+# CORS and middleware
+starlette
+
+# File handling (standard library modules - no need to include in requirements!)
+# pathlib
+# tempfile
+# uuid
+# datetime
+# io
+# os
+# re
+# json
+# asyncio
+# typing
