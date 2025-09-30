@@ -5,6 +5,12 @@ python-multipart
 jinja2
 python-dotenv
 
+# Audio Transcription Libraries (multiple options for fallback)
+faster-whisper>=0.10.0
+openai-whisper>=20231117
+vosk>=0.3.45
+SpeechRecognition>=3.10.0
+
 # AI/ML Libraries
 torch
 torchaudio
