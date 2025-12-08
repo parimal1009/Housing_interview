@@ -1,194 +1,304 @@
+"""
+Housing System Interview Application
+A professional AI-powered housing assessment tool with audio transcription and analysis.
+"""
 import os
-import io
 import json
 import asyncio
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import tempfile
 import uuid
 import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, status
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel, Field
 import uvicorn
 
 # Audio processing imports
-import librosa
-import numpy as np
-import subprocess
 import wave
 
 # AI/ML imports
 from groq import Groq
-from langchain.schema import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
 from langsmith import Client
-import re
 
 # Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging with better formatting
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(title="Housing System Interview Application", version="1.0.0")
+# Constants
+MAX_AUDIO_SIZE_MB = 25
+SUPPORTED_AUDIO_FORMATS = {'.mp3', '.mp4', '.wav', '.m4a', '.webm', '.ogg'}
+DEFAULT_PORT = 8001
+TRANSCRIPTION_TIMEOUT = 300  # 5 minutes
 
-# CORS middleware
+# Pydantic models for request/response validation
+class TranscriptionResponse(BaseModel):
+    raw_text: str
+    cleaned_text: str
+
+class QuestionResponse(BaseModel):
+    question: Dict[str, Any]
+    question_number: int
+    total_questions: int
+    progress: float
+
+class AnalysisResponse(BaseModel):
+    analysis: str
+    timestamp: str
+    question_id: int
+    session_id: str
+
+class SessionResponse(BaseModel):
+    session_id: str
+    total_questions: int
+
+class HealthResponse(BaseModel):
+    status: str
+    transcription_method: str
+    models_loaded: Dict[str, bool]
+    timestamp: str
+
+# Lifespan context manager for startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle"""
+    logger.info("🚀 Starting Housing Interview Application...")
+    # Startup: Initialize models
+    global ai_models
+    ai_models = AIModels()
+    logger.info("✅ Application started successfully")
+    yield
+    # Shutdown: Cleanup
+    logger.info("🛑 Shutting down application...")
+    if ai_models and hasattr(ai_models, 'cleanup'):
+        ai_models.cleanup()
+
+# Initialize FastAPI app with enhanced configuration
+app = FastAPI(
+    title="Housing System Interview Application",
+    description="AI-powered housing assessment tool with audio transcription and analysis",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
+)
+
+# Add middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Templates
 templates = Jinja2Templates(directory="templates")
 
 # Initialize AI models and clients
 class AIModels:
+    """Manages all AI/ML models with proper initialization and error handling"""
+    
     def __init__(self):
-        self.transcription_method = None
-        self.groq_client = None
-        self.langchain_llm = None
-        self.langsmith_client = None
+        self.transcription_method: Optional[Dict[str, Any]] = None
+        self.groq_client: Optional[Groq] = None
+        self.langchain_llm: Optional[ChatGroq] = None
+        self.langsmith_client: Optional[Client] = None
+        self._initialized = False
         self.initialize_models()
     
-    def initialize_models(self):
+    @property
+    def is_ready(self) -> bool:
+        """Check if models are initialized and ready"""
+        return self._initialized and self.transcription_method is not None
+    
+    def initialize_models(self) -> None:
         """Initialize all AI models and clients with fallback options"""
         try:
             # Initialize transcription (try multiple options)
             self.transcription_method = self._setup_transcription()
             
             # Initialize Groq client
-            if os.getenv("GROQ_API_KEY"):
-                self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-                logger.info("✅ Groq client initialized successfully!")
+            groq_api_key = os.getenv("GROQ_API_KEY")
+            if groq_api_key:
+                try:
+                    self.groq_client = Groq(api_key=groq_api_key)
+                    logger.info("✅ Groq client initialized successfully!")
+                except Exception as e:
+                    logger.error(f"❌ Failed to initialize Groq client: {e}")
             else:
-                logger.warning("⚠️ No GROQ_API_KEY found")
+                logger.warning("⚠️ No GROQ_API_KEY found - AI analysis will be limited")
             
             # Initialize LangChain with Groq
-            if os.getenv("GROQ_API_KEY"):
-                self.langchain_llm = ChatGroq(
-                    groq_api_key=os.getenv("GROQ_API_KEY"),
-                    model_name="llama-3.3-70b-versatile",
-                    temperature=0.7
-                )
-                logger.info("✅ LangChain with Groq initialized successfully!")
+            if groq_api_key:
+                try:
+                    self.langchain_llm = ChatGroq(
+                        groq_api_key=groq_api_key,
+                        model_name="llama-3.3-70b-versatile",
+                        temperature=0.7,
+                        max_retries=3,
+                        timeout=30.0
+                    )
+                    logger.info("✅ LangChain with Groq initialized successfully!")
+                except Exception as e:
+                    logger.error(f"❌ Failed to initialize LangChain: {e}")
             
             # Initialize LangSmith client
-            if os.getenv("LANGSMITH_API_KEY"):
-                self.langsmith_client = Client(
-                    api_url=os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
-                    api_key=os.getenv("LANGSMITH_API_KEY")
-                )
-                logger.info("✅ LangSmith client initialized successfully!")
+            langsmith_api_key = os.getenv("LANGSMITH_API_KEY")
+            if langsmith_api_key:
+                try:
+                    self.langsmith_client = Client(
+                        api_url=os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com"),
+                        api_key=langsmith_api_key
+                    )
+                    logger.info("✅ LangSmith client initialized successfully!")
+                except Exception as e:
+                    logger.error(f"❌ Failed to initialize LangSmith: {e}")
+            
+            self._initialized = True
+            logger.info("✅ All models initialized")
             
         except Exception as e:
-            logger.error(f"❌ Error initializing models: {str(e)}")
+            logger.error(f"❌ Critical error initializing models: {str(e)}")
+            self._initialized = False
     
-    def _setup_transcription(self):
+    def cleanup(self) -> None:
+        """Cleanup resources"""
+        logger.info("Cleaning up AI models...")
+        # Add any cleanup logic here if needed
+    
+    def _setup_transcription(self) -> Dict[str, Any]:
         """Setup transcription with multiple fallback options"""
-        # Option 1: Try Faster-Whisper (most efficient)
-        try:
-            from faster_whisper import WhisperModel
-            model = WhisperModel("base", device="cpu", compute_type="int8")
-            logger.info("✅ Faster-Whisper initialized successfully!")
-            return {"method": "faster_whisper", "model": model}
-        except ImportError:
-            logger.info("Faster-Whisper not available, trying Vosk...")
-        except Exception as e:
-            logger.warning(f"Faster-Whisper failed: {e}, trying Vosk...")
+        transcription_engines = [
+            ("faster_whisper", self._init_faster_whisper, "Faster-Whisper (recommended)"),
+            ("vosk", self._init_vosk, "Vosk (lightweight)"),
+            ("openai_whisper", self._init_openai_whisper, "OpenAI Whisper"),
+            ("speech_recognition", self._init_speech_recognition, "SpeechRecognition"),
+        ]
         
-        # Option 2: Try Vosk (lightweight, offline)
-        try:
-            import vosk
-            import json
-            # Download model if needed
-            model_path = self._ensure_vosk_model()
-            if model_path:
-                vosk_model = vosk.Model(model_path)
-                logger.info("✅ Vosk initialized successfully!")
-                return {"method": "vosk", "model": vosk_model}
-        except ImportError:
-            logger.info("Vosk not available, trying OpenAI Whisper...")
-        except Exception as e:
-            logger.warning(f"Vosk failed: {e}, trying OpenAI Whisper...")
-        
-        # Option 3: Try OpenAI Whisper (original)
-        try:
-            import whisper
-            model = whisper.load_model("base")
-            logger.info("✅ OpenAI Whisper initialized successfully!")
-            return {"method": "openai_whisper", "model": model}
-        except ImportError:
-            logger.info("OpenAI Whisper not available, trying SpeechRecognition...")
-        except Exception as e:
-            logger.warning(f"OpenAI Whisper failed: {e}, trying SpeechRecognition...")
-        
-        # Option 4: Try SpeechRecognition with Google (requires internet)
-        try:
-            import speech_recognition as sr
-            recognizer = sr.Recognizer()
-            logger.info("✅ SpeechRecognition initialized successfully!")
-            return {"method": "speech_recognition", "model": recognizer}
-        except ImportError:
-            logger.error("No transcription libraries available!")
-        except Exception as e:
-            logger.error(f"SpeechRecognition failed: {e}")
+        for method_name, init_func, display_name in transcription_engines:
+            try:
+                model = init_func()
+                if model is not None:
+                    logger.info(f"✅ {display_name} initialized successfully!")
+                    return {"method": method_name, "model": model}
+            except ImportError:
+                logger.debug(f"{display_name} not installed, trying next option...")
+            except Exception as e:
+                logger.warning(f"{display_name} initialization failed: {e}")
         
         # Fallback: Mock transcription (for development)
         logger.warning("⚠️ Using mock transcription - install a transcription library!")
         return {"method": "mock", "model": None}
     
-    def _ensure_vosk_model(self):
+    def _init_faster_whisper(self):
+        """Initialize Faster-Whisper"""
+        from faster_whisper import WhisperModel
+        return WhisperModel("base", device="cpu", compute_type="int8")
+    
+    def _init_vosk(self):
+        """Initialize Vosk"""
+        import vosk
+        model_path = self._ensure_vosk_model()
+        if model_path:
+            return vosk.Model(model_path)
+        return None
+    
+    def _init_openai_whisper(self):
+        """Initialize OpenAI Whisper"""
+        import whisper
+        return whisper.load_model("base")
+    
+    def _init_speech_recognition(self):
+        """Initialize SpeechRecognition"""
+        import speech_recognition as sr
+        return sr.Recognizer()
+    
+    def _ensure_vosk_model(self) -> Optional[str]:
         """Download Vosk model if not present"""
-        model_dir = "vosk-model"
-        if not os.path.exists(model_dir):
-            try:
-                import requests
-                import zipfile
-                
-                model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-                logger.info("Downloading Vosk model...")
-                
-                response = requests.get(model_url)
-                with open("vosk-model.zip", "wb") as f:
-                    f.write(response.content)
-                
-                with zipfile.ZipFile("vosk-model.zip", 'r') as zip_ref:
-                    zip_ref.extractall(".")
-                
-                # Rename extracted folder
-                extracted_name = "vosk-model-small-en-us-0.15"
-                if os.path.exists(extracted_name):
-                    os.rename(extracted_name, model_dir)
-                
-                os.remove("vosk-model.zip")
-                logger.info("Vosk model downloaded successfully!")
-                return model_dir
-            except Exception as e:
-                logger.error(f"Failed to download Vosk model: {e}")
-                return None
-        return model_dir
+        model_dir = Path("vosk-model")
+        
+        if model_dir.exists():
+            return str(model_dir)
+        
+        try:
+            import requests
+            import zipfile
+            
+            model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+            zip_path = Path("vosk-model.zip")
+            
+            logger.info("Downloading Vosk model...")
+            response = requests.get(model_url, timeout=60)
+            response.raise_for_status()
+            
+            zip_path.write_bytes(response.content)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(".")
+            
+            # Rename extracted folder
+            extracted_name = Path("vosk-model-small-en-us-0.15")
+            if extracted_name.exists():
+                extracted_name.rename(model_dir)
+            
+            zip_path.unlink()
+            logger.info("✅ Vosk model downloaded successfully!")
+            return str(model_dir)
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to download Vosk model: {e}")
+            return None
 
 # Initialize models globally
 ai_models = AIModels()
 
 class HousingInterviewer:
-    """Main class for housing system interviews"""
+    """Main class for housing system interviews with improved session management"""
     
     def __init__(self):
-        self.questions = self._get_housing_questions()
-        self.interview_sessions = {}
+        self.questions: List[Dict[str, Any]] = self._get_housing_questions()
+        self.interview_sessions: Dict[str, Dict[str, Any]] = {}
+        self._session_lock = asyncio.Lock()
+    
+    async def create_session(self) -> str:
+        """Create a new interview session with thread-safe ID generation"""
+        async with self._session_lock:
+            session_id = str(uuid.uuid4())
+            self.interview_sessions[session_id] = {
+                "created_at": datetime.now().isoformat(),
+                "current_question": 0,
+                "responses": [],
+                "participant_info": {},
+                "last_activity": datetime.now().isoformat()
+            }
+            return session_id
+    
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session data with validation"""
+        return self.interview_sessions.get(session_id)
+    
+    def update_session_activity(self, session_id: str) -> None:
+        """Update last activity timestamp"""
+        if session_id in self.interview_sessions:
+            self.interview_sessions[session_id]["last_activity"] = datetime.now().isoformat()
     
     def _get_housing_questions(self) -> List[Dict[str, Any]]:
         """Define comprehensive housing interview questions"""
@@ -266,13 +376,29 @@ class HousingInterviewer:
         ]
     
     async def transcribe_audio(self, audio_file: UploadFile) -> Dict[str, str]:
-        """Transcribe audio using available transcription method"""
+        """Transcribe audio using available transcription method with validation"""
+        # Validate file size
+        audio_bytes = await audio_file.read()
+        file_size_mb = len(audio_bytes) / (1024 * 1024)
+        
+        if file_size_mb > MAX_AUDIO_SIZE_MB:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File size ({file_size_mb:.1f}MB) exceeds maximum allowed size ({MAX_AUDIO_SIZE_MB}MB)"
+            )
+        
+        # Validate file format
+        file_ext = Path(audio_file.filename).suffix.lower()
+        if file_ext not in SUPPORTED_AUDIO_FORMATS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported audio format: {file_ext}. Supported: {', '.join(SUPPORTED_AUDIO_FORMATS)}"
+            )
+        
+        tmp_path = None
         try:
-            # Read audio file
-            audio_bytes = await audio_file.read()
-            
             # Save to temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
                 tmp_file.write(audio_bytes)
                 tmp_path = tmp_file.name
             
@@ -298,10 +424,11 @@ class HousingInterviewer:
                 raw_transcription = "This is a mock transcription for testing purposes. Please install a transcription library for actual functionality."
             
             # Clean up temporary file
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
+            if tmp_path and Path(tmp_path).exists():
+                try:
+                    Path(tmp_path).unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to delete temp file {tmp_path}: {e}")
             
             # Process and clean the transcription
             cleaned_transcription = await self._clean_transcription(raw_transcription)
@@ -311,9 +438,21 @@ class HousingInterviewer:
                 "cleaned_text": cleaned_transcription
             }
             
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+            logger.error(f"Transcription failed: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Transcription failed: {str(e)}"
+            )
+        finally:
+            # Ensure cleanup
+            if tmp_path and Path(tmp_path).exists():
+                try:
+                    Path(tmp_path).unlink()
+                except:
+                    pass
     
     async def _transcribe_faster_whisper(self, model, audio_path):
         """Transcribe using Faster-Whisper"""
@@ -371,10 +510,15 @@ class HousingInterviewer:
             raise Exception(f"SpeechRecognition transcription failed: {str(e)}")
     
     async def _clean_transcription(self, raw_text: str) -> str:
-        """Clean and process transcription using LLM"""
+        """Clean and process transcription using LLM with timeout and retry"""
+        if not raw_text or not raw_text.strip():
+            return raw_text
+        
+        if not ai_models.groq_client:
+            logger.debug("Groq client not available, returning raw text")
+            return raw_text
+        
         try:
-            if not ai_models.groq_client or not raw_text.strip():
-                return raw_text
             
             cleaning_prompt = f"""
             You are an expert transcription cleaner. Clean the following transcription by:
@@ -396,25 +540,30 @@ class HousingInterviewer:
                     {"role": "user", "content": cleaning_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=1000
+                max_tokens=1000,
+                timeout=30
             )
             
             return response.choices[0].message.content.strip()
             
         except Exception as e:
-            logger.error(f"Error cleaning transcription: {e}")
-            return raw_text  # Return raw text if cleaning fails
+            logger.error(f"Error cleaning transcription: {e}", exc_info=True)
+            return raw_text  # Graceful fallback
     
     async def analyze_response(self, question: Dict, transcription: str, session_id: str) -> Dict[str, Any]:
-        """Analyze interview response using LLM"""
+        """Analyze interview response using LLM with comprehensive error handling"""
+        timestamp = datetime.now().isoformat()
+        
+        if not ai_models.groq_client:
+            logger.warning("Groq client not available for analysis")
+            return {
+                "analysis": "Response recorded successfully. AI analysis temporarily unavailable.",
+                "timestamp": timestamp,
+                "question_id": question['id'],
+                "session_id": session_id
+            }
+        
         try:
-            if not ai_models.groq_client:
-                return {
-                    "analysis": "Response recorded successfully. Analysis temporarily unavailable.",
-                    "timestamp": datetime.now().isoformat(),
-                    "question_id": question['id'],
-                    "session_id": session_id
-                }
             
             analysis_prompt = f"""
             You are a professional housing services analyst. Analyze this interview response:
@@ -440,43 +589,50 @@ class HousingInterviewer:
                     {"role": "user", "content": analysis_prompt}
                 ],
                 temperature=0.5,
-                max_tokens=800
+                max_tokens=800,
+                timeout=30
             )
             
             analysis = response.choices[0].message.content.strip()
             
-            # Log to LangSmith if available
+            # Log to LangSmith if available (non-blocking)
             if ai_models.langsmith_client:
-                try:
-                    ai_models.langsmith_client.create_run(
-                        name="housing_response_analysis",
-                        run_type="llm",
-                        inputs={
-                            "question_category": question['category'],
-                            "question": question['question'],
-                            "response": transcription,
-                            "session_id": session_id
-                        },
-                        outputs={"analysis": analysis},
-                        project_name=os.getenv("LANGSMITH_PROJECT", "HOUSING_SYSTEM")
-                    )
-                except Exception as logging_error:
-                    logger.error(f"LangSmith logging error: {logging_error}")
+                asyncio.create_task(self._log_to_langsmith(question, transcription, analysis, session_id))
             
             return {
                 "analysis": analysis,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": timestamp,
                 "question_id": question['id'],
                 "session_id": session_id
             }
             
         except Exception as e:
-            logger.error(f"Error analyzing response: {e}")
+            logger.error(f"Error analyzing response: {e}", exc_info=True)
             return {
                 "analysis": "Response recorded successfully. Analysis temporarily unavailable due to technical issues.",
                 "error": str(e),
-                "timestamp": datetime.now().isoformat()
+                "timestamp": timestamp,
+                "question_id": question.get('id', 0),
+                "session_id": session_id
             }
+    
+    async def _log_to_langsmith(self, question: Dict, transcription: str, analysis: str, session_id: str) -> None:
+        """Log analysis to LangSmith asynchronously"""
+        try:
+            ai_models.langsmith_client.create_run(
+                name="housing_response_analysis",
+                run_type="llm",
+                inputs={
+                    "question_category": question.get('category', 'Unknown'),
+                    "question": question.get('question', ''),
+                    "response": transcription,
+                    "session_id": session_id
+                },
+                outputs={"analysis": analysis},
+                project_name=os.getenv("LANGSMITH_PROJECT", "HOUSING_SYSTEM")
+            )
+        except Exception as e:
+            logger.error(f"LangSmith logging error: {e}")
     
     async def generate_summary_report(self, session_id: str) -> Dict[str, Any]:
         """Generate comprehensive interview summary"""
@@ -560,51 +716,78 @@ interviewer = HousingInterviewer()
 
 # Routes
 @app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    """Main page"""
-    # Read the HTML file directly since templates directory might not exist
+async def read_root(request: Request) -> HTMLResponse:
+    """Main page with proper error handling"""
+    template_path = Path("templates/index.html")
+    
     try:
-        with open("templates/index.html", "r", encoding="utf-8") as f:
-            html_content = f.read()
+        if not template_path.exists():
+            logger.error(f"Template not found: {template_path}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Application template not found"
+            )
+        
+        html_content = template_path.read_text(encoding="utf-8")
         return HTMLResponse(content=html_content)
-    except FileNotFoundError:
-        # Fallback HTML if template not found
-        return HTMLResponse(content="""
-        <!DOCTYPE html>
-        <html>
-        <head><title>Housing Interview</title></head>
-        <body>
-            <h1>Housing System Interview</h1>
-            <p>Template file not found. Please ensure templates/index.html exists.</p>
-        </body>
-        </html>
-        """)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error loading template: {e}")
+        # Fallback HTML
+        return HTMLResponse(
+            content="""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Housing Interview - Error</title></head>
+            <body>
+                <h1>Housing System Interview</h1>
+                <p>Application error. Please contact support.</p>
+            </body>
+            </html>
+            """,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-@app.post("/start_session")
-async def start_interview_session():
-    """Start a new interview session"""
-    session_id = str(uuid.uuid4())
-    interviewer.interview_sessions[session_id] = {
-        "created_at": datetime.now().isoformat(),
-        "current_question": 0,
-        "responses": [],
-        "participant_info": {}
-    }
-    return {"session_id": session_id, "total_questions": len(interviewer.questions)}
+@app.post("/start_session", response_model=SessionResponse)
+async def start_interview_session() -> SessionResponse:
+    """Start a new interview session with validation"""
+    try:
+        session_id = await interviewer.create_session()
+        return SessionResponse(
+            session_id=session_id,
+            total_questions=len(interviewer.questions)
+        )
+    except Exception as e:
+        logger.error(f"Failed to create session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create interview session"
+        )
 
 @app.get("/get_question/{session_id}")
-async def get_question(session_id: str, question_num: Optional[int] = None):
-    """Get current or specific question"""
-    if session_id not in interviewer.interview_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_question(session_id: str, question_num: Optional[int] = None) -> Dict[str, Any]:
+    """Get current or specific question with validation"""
+    session = interviewer.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
     
-    session = interviewer.interview_sessions[session_id]
+    interviewer.update_session_activity(session_id)
     
     if question_num is None:
         question_num = session.get("current_question", 0)
     
-    if question_num >= len(interviewer.questions):
-        return {"completed": True, "message": "Interview completed"}
+    if question_num < 0 or question_num >= len(interviewer.questions):
+        if question_num >= len(interviewer.questions):
+            return {"completed": True, "message": "Interview completed"}
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid question number"
+        )
     
     question = interviewer.questions[question_num]
     return {
@@ -615,17 +798,29 @@ async def get_question(session_id: str, question_num: Optional[int] = None):
     }
 
 @app.post("/transcribe_audio/{session_id}")
-async def transcribe_audio_endpoint(session_id: str, audio_file: UploadFile = File(...)):
-    """Transcribe uploaded audio file"""
+async def transcribe_audio_endpoint(
+    session_id: str,
+    audio_file: UploadFile = File(...)
+) -> Dict[str, Any]:
+    """Transcribe uploaded audio file with comprehensive validation"""
+    # Validate session
+    session = interviewer.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    interviewer.update_session_activity(session_id)
+    
+    # Validate filename
+    if not audio_file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No filename provided"
+        )
+    
     try:
-        if session_id not in interviewer.interview_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        # Validate file type
-        allowed_extensions = ['.mp3', '.mp4', '.wav', '.m4a', '.webm', '.ogg']
-        if not any(audio_file.filename.lower().endswith(ext) for ext in allowed_extensions):
-            raise HTTPException(status_code=400, detail="Unsupported audio format")
-        
         # Transcribe audio
         transcription_result = await interviewer.transcribe_audio(audio_file)
         
@@ -636,28 +831,48 @@ async def transcribe_audio_endpoint(session_id: str, audio_file: UploadFile = Fi
             "transcription_method": ai_models.transcription_method.get("method", "unknown") if ai_models.transcription_method else "none"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Transcription endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Transcription endpoint error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Transcription failed: {str(e)}"
+        )
 
 @app.post("/submit_response/{session_id}")
 async def submit_response(
     session_id: str,
-    question_id: int = Form(...),
+    question_id: int = Form(..., ge=1),
     raw_transcription: str = Form(...),
     cleaned_transcription: str = Form(...)
-):
-    """Submit interview response for analysis"""
+) -> Dict[str, Any]:
+    """Submit interview response for analysis with validation"""
+    # Validate session
+    session = interviewer.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    interviewer.update_session_activity(session_id)
+    
+    # Validate question ID
+    if question_id < 1 or question_id > len(interviewer.questions):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid question ID: {question_id}"
+        )
+    
+    # Validate transcription
+    if not cleaned_transcription.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Transcription cannot be empty"
+        )
+    
     try:
-        if session_id not in interviewer.interview_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        session = interviewer.interview_sessions[session_id]
-        
-        # Get question details
-        if question_id - 1 >= len(interviewer.questions):
-            raise HTTPException(status_code=400, detail="Invalid question ID")
-        
         question = interviewer.questions[question_id - 1]
         
         # Analyze the response
@@ -683,47 +898,64 @@ async def submit_response(
             "next_question": question_id < len(interviewer.questions)
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Submit response error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Submit response error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to submit response: {str(e)}"
+        )
 
 @app.get("/generate_report/{session_id}")
-async def generate_report(session_id: str):
-    """Generate final interview report"""
+async def generate_report(session_id: str) -> Dict[str, Any]:
+    """Generate final interview report with validation"""
+    session = interviewer.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    interviewer.update_session_activity(session_id)
+    
     try:
-        if session_id not in interviewer.interview_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
         report = await interviewer.generate_summary_report(session_id)
         return report
         
     except Exception as e:
-        logger.error(f"Generate report error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Generate report error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate report: {str(e)}"
+        )
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+@app.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """Health check endpoint with detailed status"""
     transcription_status = "none"
     if ai_models.transcription_method:
         transcription_status = ai_models.transcription_method.get("method", "unknown")
     
-    return {
-        "status": "healthy",
-        "transcription_method": transcription_status,
-        "models_loaded": {
+    return HealthResponse(
+        status="healthy" if ai_models.is_ready else "degraded",
+        transcription_method=transcription_status,
+        models_loaded={
             "transcription": ai_models.transcription_method is not None,
             "groq": ai_models.groq_client is not None,
-            "langchain": ai_models.langchain_llm is not None
+            "langchain": ai_models.langchain_llm is not None,
+            "langsmith": ai_models.langsmith_client is not None
         },
-        "timestamp": datetime.now().isoformat()
-    }
+        timestamp=datetime.now().isoformat()
+    )
 
-if __name__ == "__main__":
-    print("🏠 Housing System Interview Application")
-    print("=" * 50)
+def print_startup_info():
+    """Print application startup information"""
+    print("\n" + "=" * 60)
+    print("🏠 HOUSING SYSTEM INTERVIEW APPLICATION")
+    print("=" * 60)
     
-    # Print initialization status
+    # Print model status
     if ai_models.transcription_method:
         method = ai_models.transcription_method.get("method", "unknown")
         print(f"✅ Transcription: {method}")
@@ -731,30 +963,34 @@ if __name__ == "__main__":
         print("❌ Transcription: Not available")
     
     print(f"✅ Groq API: {'Available' if ai_models.groq_client else 'Not configured'}")
+    print(f"✅ LangChain: {'Available' if ai_models.langchain_llm else 'Not configured'}")
     print(f"✅ LangSmith: {'Available' if ai_models.langsmith_client else 'Not configured'}")
-    print("=" * 50)
     
-    # Installation instructions
-    print("\n📦 To install missing dependencies:")
-    print("pip install faster-whisper  # Recommended")
-    print("pip install vosk  # Lightweight alternative")
-    print("pip install openai-whisper  # Original Whisper")
-    print("pip install speechrecognition  # Basic option")
-    print("\n🌐 Starting server on http://localhost:8000")
+    print("\n" + "=" * 60)
+    print("📦 INSTALLATION TIPS")
+    print("=" * 60)
+    print("For transcription support, install one of:")
+    print("  • pip install faster-whisper  (Recommended)")
+    print("  • pip install vosk  (Lightweight)")
+    print("  • pip install openai-whisper  (Original)")
+    print("  • pip install speechrecognition  (Basic)")
     
+    port = int(os.environ.get("PORT", DEFAULT_PORT))
+    print("\n" + "=" * 60)
+    print(f"🌐 Server starting on http://localhost:{port}")
+    print(f"📚 API Docs: http://localhost:{port}/api/docs")
+    print("=" * 60 + "\n")
+
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", DEFAULT_PORT))
     
-    print("🏠 Housing System Interview Application")
-    print("=" * 50)
-    
-    # Print initialization status (same as before)
+    print_startup_info()
     
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
         reload=False,  # Disable reload in production
-        log_level="info"
+        log_level="info",
+        access_log=True
     )
